@@ -1,6 +1,7 @@
-from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QGridLayout, QLabel, 
-                             QSpinBox, QCheckBox, QComboBox, QDialogButtonBox, 
-                             QToolButton, QButtonGroup)
+from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+                             QSpinBox, QCheckBox, QComboBox, QDialogButtonBox,
+                             QToolButton, QButtonGroup, QPushButton)
+from PyQt6.QtCore import Qt
 
 class ResizeDialog(QDialog):
     def __init__(self, cur_w, cur_h, parent=None):
@@ -71,3 +72,59 @@ class ResizeDialog(QDialog):
         if self.mode_combo.currentText() == "Pixels": return self.w_spin.value(), self.h_spin.value(), ax, ay
         pw, ph = self.w_spin.value() / 100.0, self.h_spin.value() / 100.0
         return int(self.cur_w * pw), int(self.cur_h * ph), ax, ay
+
+
+class SaveFormatDialog(QDialog):
+    """Format picker shown before the file dialog when saving."""
+    FORMATS = [
+        ("sqish", "SQ Paint Project (.sqish)",
+         "Saves all layers, names, and visibility.\nOpen later to resume exactly where you left off."),
+        ("png",   "PNG Image (.png)",
+         "Lossless quality. Best for pixel art and\nimages with transparency."),
+        ("jpg",   "JPEG Image (.jpg)",
+         "Smaller file size, no transparency.\nBest for photos."),
+        ("bmp",   "Bitmap (.bmp)",
+         "Uncompressed. Large file size."),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Save As")
+        self.setMinimumWidth(380)
+        self._chosen = None
+        self.setStyleSheet("""
+            QDialog { background: #1e1e1e; color: white; }
+            QLabel  { color: white; }
+            QPushButton {
+                background: #2e2e2e; color: white;
+                border: 1px solid #444; border-radius: 6px;
+                padding: 10px 16px; text-align: left; font-size: 13px;
+            }
+            QPushButton:hover  { background: #0078d4; border-color: #0078d4; }
+            QPushButton:pressed { background: #005fa3; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("<b>Choose a format to save as:</b>"))
+        layout.addSpacing(4)
+
+        for fmt, title, desc in self.FORMATS:
+            btn = QPushButton()
+            btn.setText(f"{title}\n{desc}")
+            btn.setMinimumHeight(56)
+            btn.clicked.connect(lambda _, f=fmt: self._pick(f))
+            layout.addWidget(btn)
+
+        layout.addSpacing(4)
+        cancel = QPushButton("Cancel")
+        cancel.setStyleSheet("background:#333; color:white; border:1px solid #555;"
+                             "border-radius:6px; padding:6px;")
+        cancel.clicked.connect(self.reject)
+        layout.addWidget(cancel)
+
+    def _pick(self, fmt):
+        self._chosen = fmt
+        self.accept()
+
+    def get_format(self):
+        return self._chosen

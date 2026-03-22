@@ -25,7 +25,7 @@ def _find_icon() -> str:
 
 def make_splash_pixmap() -> QPixmap:
     canvas = QPixmap(SPLASH_W, SPLASH_H)
-    canvas.fill(QColor(BG_COLOR))
+    canvas.fill(Qt.GlobalColor.transparent)
 
     icon_path = _find_icon()
     if icon_path:
@@ -45,9 +45,12 @@ def make_splash_pixmap() -> QPixmap:
 
 class SQSplash(QSplashScreen):
     def __init__(self):
-        super().__init__(make_splash_pixmap())
+        pixmap = make_splash_pixmap()
+        super().__init__(pixmap)
+        # Remove the black window frame/background
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
     def mousePressEvent(self, event):
-        # Don't close on click — let the app control timing
         pass

@@ -1,55 +1,82 @@
-from PyQt6.QtWidgets import QWidget, QLineEdit
+from PyQt6.QtWidgets import QWidget, QLineEdit, QTextEdit
 from PyQt6.QtCore import Qt, QPoint, QRect, QPointF
 from PyQt6.QtGui import (QPainter, QPen, QImage, QColor, QFont, QTransform,
                          QGuiApplication, QPolygon, QPainterPath, QBrush)
 from collections import deque
 import numpy as np
 import math
+import zipfile, json, io
+
+from selection import SelectionManager
+from drawing import DrawingTools
+from layers import LayerManager
+from undo_redo import UndoRedoManager
+from file_io import FileIO
+from text_tool import TextTool
+from canvas_resizer import CanvasResizer
 
 HANDLE_SIZE = 8
 ROT_HANDLE_OFFSET = 24  # px above top-center in canvas space
+EDGE_HANDLE_SIZE = 10   # size of canvas edge resize handles
+EDGE_MARGIN = 20        # extra space outside canvas for handles
 
 
 class Canvas(QWidget):
     def __init__(self):
         super().__init__()
-        self.layers = [QImage(900, 600, QImage.Format.Format_ARGB32_Premultiplied)]
+        self.layers = [QImage(2048, 1365, QImage.Format.Format_ARGB32_Premultiplied)]
         self.layers[0].fill(Qt.GlobalColor.white)
-        self.layer_names = ["Background"]; self.layer_visible = [True]; self.active_layer = 0
-        self.setFixedSize(900, 600); self.zoom_factor = 1.0
+        layer1 = QImage(2048, 1365, QImage.Format.Format_ARGB32_Premultiplied)
+        layer1.fill(Qt.GlobalColor.transparent)
+        self.layers.append(layer1)
+        self.layer_names = ["Background", "Layer 1"]
+        self.layer_visible = [True, True]
+        self.active_layer = 1
+        self.setFixedSize(2048, 1365); self.zoom_factor = 1.0
 
         self._composite_cache = None
         self._composite_dirty = True
 
-        self.text_input = QLineEdit(self); self.text_input.setFrame(False); self.text_input.hide()
-        self.text_input.returnPressed.connect(self.finalize_text)
-
-        # Selection
-        self.selection_rect = QRect()
-        self.selection_buffer = None
-        self.selection_state = "idle"   # idle|selecting|selected|moving|resizing|rotating
-        self.move_offset = QPoint()
-        self.resize_handle = -1
-        self.resize_origin_rect = QRect()
-        self.resize_origin_pos = QPoint()
-        self.selection_angle = 0.0
-        self.rotate_origin = QPointF()
-        self.rotate_start_angle = 0.0
-
         self.recent_colors = deque(maxlen=10)
-        self.undo_history, self.redo_history = [], []
         self.drawing = False; self.modified = False
         self.start_point = self.prev_point = self.last_point = QPoint()
         self.pen_color = QColor("black"); self.pen_width = 3; self.tool = "pencil"
         self.pen_opacity = 255
+        self.fill_tolerance = 30     # fill tool tolerance
+        self.use_antialiasing = True  # settings-controlled
+        self.show_brush_cursor = True # settings-controlled
+        self.round_lines = True       # settings-controlled (round vs square caps)
+        self.cursor_pos = QPoint()   # for brush cursor overlay
         self.stroke_buffer = None
-        self.text_pos = QPoint()
         self.font_family = "Arial"
         self.font_size = 14
         self.font_bold = False
         self.font_italic = False
-        self.status_callback = self.zoom_callback = self.dim_callback = \
-            self.color_picked_callback = self.layers_changed_callback = None
+        self.status_callback = self.zoom_callback = self.dim_callback =             self.color_picked_callback = self.layers_changed_callback = None
+
+        # Initialize managers
+        self.selection_manager = SelectionManager(self)
+        self.drawing_tools = DrawingTools(self)
+        self.layer_manager = LayerManager(self)
+        self.undo_redo_manager = UndoRedoManager(self)
+        self.text_tool = TextTool(self)
+        self.canvas_resizer = CanvasResizer(self)
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if obj is self.text_tool.text_input and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            mods = event.modifiers()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and mods & Qt.KeyboardModifier.ControlModifier:
+                self.text_tool.finalize_text()
+                return True
+            if key == Qt.Key.Key_Escape:
+                self.text_tool.text_input.clear()
+                self.text_tool.text_input.hide()
+                self.text_tool.active = False
+                self.update()
+                return True
+        return False
 
     # ── Composite cache ───────────────────────────────────────────────────────
     def _invalidate_composite(self): self._composite_dirty = True
@@ -59,8 +86,12 @@ class Canvas(QWidget):
             comp = QImage(self.layers[0].size(), QImage.Format.Format_ARGB32_Premultiplied)
             comp.fill(Qt.GlobalColor.transparent)
             p = QPainter(comp)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             for i, layer in enumerate(self.layers):
-                if self.layer_visible[i]: p.drawImage(0, 0, layer)
+                if self.layer_visible[i]:
+                    p.drawImage(0, 0, layer)
             p.end()
             self._composite_cache = comp
             self._composite_dirty = False
@@ -68,112 +99,60 @@ class Canvas(QWidget):
 
     def get_active(self): return self.layers[self.active_layer]
 
-    # ── Handle helpers ────────────────────────────────────────────────────────
-    def _handle_rects(self):
-        r = self.selection_rect.normalized()
-        cx, cy = r.center().x(), r.center().y()
-        pts = [
-            QPoint(r.left(),  r.top()),
-            QPoint(cx,        r.top()),
-            QPoint(r.right(), r.top()),
-            QPoint(r.left(),  cy),
-            QPoint(r.right(), cy),
-            QPoint(r.left(),  r.bottom()),
-            QPoint(cx,        r.bottom()),
-            QPoint(r.right(), r.bottom()),
-        ]
-        hs = HANDLE_SIZE // 2
-        return [QRect(pt.x()-hs, pt.y()-hs, HANDLE_SIZE, HANDLE_SIZE) for pt in pts]
-
-    def _rot_handle_pos(self):
-        r = self.selection_rect.normalized()
-        return QPoint(r.center().x(), r.top() - ROT_HANDLE_OFFSET)
-
-    def _hit_handle(self, pos):
-        for i, hr in enumerate(self._handle_rects()):
-            if hr.contains(pos): return i
-        return -1
-
-    def _hit_rot_handle(self, pos):
-        rp = self._rot_handle_pos()
-        return (pos - rp).manhattanLength() <= HANDLE_SIZE + 2
-
     # ── Selection ─────────────────────────────────────────────────────────────
-    def lift_selection(self):
-        active = self.get_active()
-        r = self.selection_rect.normalized().intersected(active.rect())
-        if r.width() < 2 or r.height() < 2:
-            self.selection_state = "idle"; self.selection_rect = QRect(); return
-        self.save_state()
-        self.selection_buffer = active.copy(r)
-        p = QPainter(active)
-        if self.active_layer == 0:
-            p.fillRect(r, Qt.GlobalColor.white)
-        else:
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            p.fillRect(r, Qt.GlobalColor.transparent)
-        p.end()
-        self._invalidate_composite()
-        self.selection_rect = r
-        self.selection_angle = 0.0
-        self.selection_state = "selected"
-        self.update()
-
-    def commit_selection(self):
-        if self.selection_state in ["selected", "moving", "resizing", "rotating"] \
-                and self.selection_buffer:
-            p = QPainter(self.get_active())
-            if self.selection_angle != 0.0:
-                rotated = self._rotated_buffer()
-                cx = self.selection_rect.center().x() - rotated.width() // 2
-                cy = self.selection_rect.center().y() - rotated.height() // 2
-                p.drawImage(cx, cy, rotated)
-            else:
-                p.drawImage(self.selection_rect.topLeft(), self.selection_buffer)
-            p.end()
-            self._invalidate_composite()
-            self.modified = True
-        self.selection_buffer = None
-        self.selection_rect = QRect()
-        self.selection_state = "idle"
-        self.selection_angle = 0.0
-        self.update()
-
-    def _rotated_buffer(self):
-        if self.selection_buffer is None: return None
-        t = QTransform().rotate(self.selection_angle)
-        return self.selection_buffer.transformed(t, Qt.TransformationMode.SmoothTransformation)
+    def lift_selection(self): self.selection_manager.lift_selection()
+    def commit_selection(self): self.selection_manager.commit_selection()
+    def select_all(self): self.selection_manager.select_all()
+    def cut_selection(self): self.selection_manager.cut_selection()
+    def delete_selection(self): self.selection_manager.delete_selection()
+    def cancel_selection(self): self.selection_manager.cancel_selection()
+    def nudge_selection(self, dx, dy): self.selection_manager.nudge_selection(dx, dy)
+    def copy_selection(self): self.selection_manager.copy_selection()
+    def paste_from_clipboard(self): self.selection_manager.paste_from_clipboard()
 
     # ── Mouse events ──────────────────────────────────────────────────────────
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            screen_pos = event.position().toPoint()
             pos = self.map_to_canvas(event.position())
 
+            # Check edge handles first (in screen coords, before zoom mapping)
+            edge = self.canvas_resizer._hit_edge_handle(screen_pos)
+            if edge:
+                self.canvas_resizer._edge_drag = edge
+                self.canvas_resizer._edge_drag_start = screen_pos
+                self.canvas_resizer._edge_drag_orig_w = self.layers[0].width()
+                self.canvas_resizer._edge_drag_orig_h = self.layers[0].height()
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor if edge == "corner"
+                               else Qt.CursorShape.SizeHorCursor if edge == "right"
+                               else Qt.CursorShape.SizeVerCursor)
+                return
+
             if self.tool == "select":
-                if self.selection_state in ["selected", "moving", "resizing", "rotating"]:
-                    if self._hit_rot_handle(pos):
-                        self.selection_state = "rotating"
-                        self.rotate_origin = QPointF(self.selection_rect.center())
-                        dx = pos.x() - self.rotate_origin.x()
-                        dy = pos.y() - self.rotate_origin.y()
-                        self.rotate_start_angle = math.degrees(math.atan2(dy, dx)) \
-                            - self.selection_angle
+                if self.selection_manager.selection_state in ["selected", "moving", "resizing", "rotating"]:
+                    if self.selection_manager._hit_rot_handle(pos):
+                        self.selection_manager.selection_state = "rotating"
+                        self.selection_manager.rotate_origin = QPointF(self.selection_manager.selection_rect.center())
+                        dx = pos.x() - self.selection_manager.rotate_origin.x()
+                        dy = pos.y() - self.selection_manager.rotate_origin.y()
+                        self.selection_manager.rotate_start_angle = math.degrees(math.atan2(dy, dx)) \
+                            - self.selection_manager.selection_angle
                         return
-                    h = self._hit_handle(pos)
+                    h = self.selection_manager._hit_handle(pos)
                     if h >= 0:
-                        self.selection_state = "resizing"
-                        self.resize_handle = h
-                        self.resize_origin_rect = QRect(self.selection_rect)
-                        self.resize_origin_pos = pos
+                        self.selection_manager.selection_state = "resizing"
+                        self.selection_manager.resize_handle = h
+                        self.selection_manager.resize_origin_rect = QRect(self.selection_manager.selection_rect)
+                        self.selection_manager.resize_origin_pos = pos
                         return
-                    if self.selection_rect.contains(pos):
-                        self.selection_state = "moving"
-                        self.move_offset = pos - self.selection_rect.topLeft()
+                    if self.selection_manager.selection_rect.contains(pos):
+                        self.selection_manager.selection_state = "moving"
+                        self.selection_manager.move_offset = pos - self.selection_manager.selection_rect.topLeft()
                         return
-                    self.commit_selection()
-                self.selection_state = "selecting"
+                    self.selection_manager.commit_selection()
+                self.selection_manager.selection_state = "selecting"
                 self.start_point = pos
-                self.selection_rect = QRect(pos, pos)
+                self.selection_manager.selection_rect = QRect(pos, pos)
                 return
 
             if self.tool == "picker":
@@ -184,27 +163,12 @@ class Canvas(QWidget):
                 return
 
             if self.tool == "text":
-                if self.text_input.isVisible():
-                    self.finalize_text()
-                else:
-                    self.text_pos = pos
-                    scaled_f = int(self.font_size * self.zoom_factor)
-                    bold_str = "bold" if self.font_bold else "normal"
-                    italic_str = "italic" if self.font_italic else "normal"
-                    self.text_input.setStyleSheet(
-                        f"background:transparent; border:1px dashed #ccc; "
-                        f"color:{self.pen_color.name()}; font-size:{scaled_f}pt; "
-                        f"font-family:{self.font_family}; font-weight:{bold_str}; "
-                        f"font-style:{italic_str};")
-                    sp = event.position().toPoint()
-                    self.text_input.setGeometry(sp.x(), sp.y(),
-                        int(500 * self.zoom_factor), scaled_f + 20)
-                    self.text_input.show(); self.text_input.setFocus()
+                self.text_tool.start_text_input(pos)
                 return
 
-            self.save_state()
+            self.undo_redo_manager.save_state()
             if self.tool == "fill":
-                self.flood_fill(pos.x(), pos.y())
+                self.drawing_tools.flood_fill(pos.x(), pos.y())
                 self._invalidate_composite()
             else:
                 self.drawing = True
@@ -220,30 +184,50 @@ class Canvas(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = self.map_to_canvas(event.position())
+        screen_pos = event.position().toPoint()
         held = event.buttons() & Qt.MouseButton.LeftButton
 
+        # Edge drag resize — show ghost preview, commit on release
+        if self.canvas_resizer._edge_drag and held:
+            dx = int((screen_pos.x() - self.canvas_resizer._edge_drag_start.x()) / self.zoom_factor)
+            dy = int((screen_pos.y() - self.canvas_resizer._edge_drag_start.y()) / self.zoom_factor)
+            self.canvas_resizer._edge_drag_w = max(10, self.canvas_resizer._edge_drag_orig_w + (dx if self.canvas_resizer._edge_drag in ("right",  "corner") else 0))
+            self.canvas_resizer._edge_drag_h = max(10, self.canvas_resizer._edge_drag_orig_h + (dy if self.canvas_resizer._edge_drag in ("bottom", "corner") else 0))
+            if self.dim_callback: self.dim_callback(f"{self.canvas_resizer._edge_drag_w} x {self.canvas_resizer._edge_drag_h}px")
+            self.update()
+            return
+
+        # Update cursor when hovering over edge handles (not dragging)
+        if not held:
+            edge = self.canvas_resizer._hit_edge_handle(screen_pos)
+            if edge == "corner":   self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif edge == "right":  self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif edge == "bottom": self.setCursor(Qt.CursorShape.SizeVerCursor)
+            elif self.tool not in ["select"]:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+
         if self.tool == "select":
-            if self.selection_state == "selecting" and held:
-                self.selection_rect = QRect(self.start_point, pos).normalized()
-            elif self.selection_state == "moving" and held:
-                self.selection_rect.moveTo(pos - self.move_offset)
-            elif self.selection_state == "rotating" and held:
-                dx = pos.x() - self.rotate_origin.x()
-                dy = pos.y() - self.rotate_origin.y()
+            if self.selection_manager.selection_state == "selecting" and held:
+                self.selection_manager.selection_rect = QRect(self.start_point, pos).normalized()
+            elif self.selection_manager.selection_state == "moving" and held:
+                self.selection_manager.selection_rect.moveTo(pos - self.selection_manager.move_offset)
+            elif self.selection_manager.selection_state == "rotating" and held:
+                dx = pos.x() - self.selection_manager.rotate_origin.x()
+                dy = pos.y() - self.selection_manager.rotate_origin.y()
                 raw = math.degrees(math.atan2(dy, dx))
-                self.selection_angle = raw - self.rotate_start_angle
+                self.selection_manager.selection_angle = raw - self.selection_manager.rotate_start_angle
                 if QGuiApplication.keyboardModifiers() == Qt.KeyboardModifier.ShiftModifier:
-                    self.selection_angle = round(self.selection_angle / 15) * 15
-            elif self.selection_state == "resizing" and held:
-                self._apply_resize(pos)
+                    self.selection_manager.selection_angle = round(self.selection_manager.selection_angle / 15) * 15
+            elif self.selection_manager.selection_state == "resizing" and held:
+                self.selection_manager._apply_resize(pos)
 
             # Cursor feedback
-            if self.selection_state in ["selected", "moving", "resizing", "rotating"]:
-                if self._hit_rot_handle(pos):
+            if self.selection_manager.selection_state in ["selected", "moving", "resizing", "rotating"]:
+                if self.selection_manager._hit_rot_handle(pos):
                     self.setCursor(Qt.CursorShape.CrossCursor)
-                elif self._hit_handle(pos) >= 0:
+                elif self.selection_manager._hit_handle(pos) >= 0:
                     self.setCursor(Qt.CursorShape.SizeBDiagCursor)
-                elif self.selection_rect.contains(pos):
+                elif self.selection_manager.selection_rect.contains(pos):
                     self.setCursor(Qt.CursorShape.SizeAllCursor)
                 else:
                     self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -254,28 +238,26 @@ class Canvas(QWidget):
                 if self.tool in ["pencil"] and self.stroke_buffer is not None:
                     p = QPainter(self.stroke_buffer)
                     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-                    p.setPen(QPen(self.pen_color, self.pen_width,
-                        Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                        Qt.PenJoinStyle.RoundJoin))
+                    cap  = Qt.PenCapStyle.RoundCap  if self.round_lines else Qt.PenCapStyle.SquareCap
+                    join = Qt.PenJoinStyle.RoundJoin if self.round_lines else Qt.PenJoinStyle.MiterJoin
+                    p.setPen(QPen(self.pen_color, self.pen_width, Qt.PenStyle.SolidLine, cap, join))
                     p.drawLine(self.prev_point, pos); p.end()
                 else:
                     p = QPainter(self.get_active())
                     p.setRenderHint(QPainter.RenderHint.Antialiasing)
                     if self.tool == "eraser":
+                        _cap  = Qt.PenCapStyle.RoundCap  if self.round_lines else Qt.PenCapStyle.SquareCap
+                        _join = Qt.PenJoinStyle.RoundJoin if self.round_lines else Qt.PenJoinStyle.MiterJoin
                         if self.active_layer == 0:
-                            p.setPen(QPen(Qt.GlobalColor.white, self.pen_width,
-                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                                Qt.PenJoinStyle.RoundJoin))
+                            p.setPen(QPen(Qt.GlobalColor.white, self.pen_width, Qt.PenStyle.SolidLine, _cap, _join))
                         else:
                             p.setCompositionMode(
                                 QPainter.CompositionMode.CompositionMode_Clear)
-                            p.setPen(QPen(Qt.GlobalColor.transparent, self.pen_width,
-                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                                Qt.PenJoinStyle.RoundJoin))
+                            p.setPen(QPen(Qt.GlobalColor.transparent, self.pen_width, Qt.PenStyle.SolidLine, _cap, _join))
                     else:
-                        p.setPen(QPen(self.pen_color, self.pen_width,
-                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                            Qt.PenJoinStyle.RoundJoin))
+                        _cap  = Qt.PenCapStyle.RoundCap  if self.round_lines else Qt.PenCapStyle.SquareCap
+                        _join = Qt.PenJoinStyle.RoundJoin if self.round_lines else Qt.PenJoinStyle.MiterJoin
+                        p.setPen(QPen(self.pen_color, self.pen_width, Qt.PenStyle.SolidLine, _cap, _join))
                     p.drawLine(self.prev_point, pos); p.end()
                     self._invalidate_composite()
                 self.prev_point = pos
@@ -285,130 +267,86 @@ class Canvas(QWidget):
                 p = QPainter(self.stroke_buffer)
                 p.setRenderHint(QPainter.RenderHint.Antialiasing)
                 p.setPen(QPen(self.pen_color, self.pen_width))
-                self._draw_shape(p, self.tool,
+                self.drawing_tools._draw_shape(p, self.tool,
                     self.start_point, self.apply_constraints(self.start_point, pos))
                 p.end()
             self.last_point = self.apply_constraints(self.start_point, pos)
             self.update()
 
+        self.cursor_pos = pos
         if self.status_callback: self.status_callback(f"{pos.x()}, {pos.y()}px")
+        if self.tool in ["pencil", "eraser"]: self.update()  # refresh cursor overlay
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self.canvas_resizer._edge_drag:
+                new_w, new_h = self.canvas_resizer._edge_drag_w or self.canvas_resizer._edge_drag_orig_w,                                self.canvas_resizer._edge_drag_h or self.canvas_resizer._edge_drag_orig_h
+                if new_w != self.canvas_resizer._edge_drag_orig_w or new_h != self.canvas_resizer._edge_drag_orig_h:
+                    self.undo_redo_manager.save_state()
+                    for i in range(len(self.layers)):
+                        new_img = QImage(new_w, new_h, QImage.Format.Format_ARGB32_Premultiplied)
+                        new_img.fill(Qt.GlobalColor.white if i == 0 else Qt.GlobalColor.transparent)
+                        p = QPainter(new_img)
+                        p.drawImage(0, 0, self.layers[i]); p.end()
+                        self.layers[i] = new_img
+                    self._invalidate_composite()
+                    self.set_zoom(self.zoom_factor)
+                self.canvas_resizer._edge_drag = None
+                self.canvas_resizer._edge_drag_w = 0
+                self.canvas_resizer._edge_drag_h = 0
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                return
             if self.tool == "select":
-                if self.selection_state == "selecting":
-                    self.lift_selection()
-                elif self.selection_state in ["moving", "rotating"]:
-                    self.selection_state = "selected"
-                elif self.selection_state == "resizing":
-                    if self.selection_buffer:
-                        raw = self.selection_rect
+                if self.selection_manager.selection_state == "selecting":
+                    self.selection_manager.lift_selection()
+                elif self.selection_manager.selection_state in ["moving", "rotating"]:
+                    self.selection_manager.selection_state = "selected"
+                elif self.selection_manager.selection_state == "resizing":
+                    if self.selection_manager.selection_buffer:
+                        raw = self.selection_manager.selection_rect
                         flip_h = raw.width() < 0
                         flip_v = raw.height() < 0
                         r = raw.normalized()
-                        buf = self.selection_buffer.scaled(
+                        buf = self.selection_manager.selection_buffer.scaled(
                             max(1, r.width()), max(1, r.height()),
                             Qt.AspectRatioMode.IgnoreAspectRatio,
                             Qt.TransformationMode.SmoothTransformation)
                         # Mirror buffer if the rect was dragged past zero
                         if flip_h or flip_v:
                             buf = buf.mirrored(flip_h, flip_v)
-                        self.selection_buffer = buf
-                        self.selection_rect = r
-                    self.selection_state = "selected"
+                        self.selection_manager.selection_buffer = buf
+                        self.selection_manager.selection_rect = r
+                    self.selection_manager.selection_state = "selected"
             elif self.drawing:
                 if self.stroke_buffer is not None:
                     p = QPainter(self.get_active())
+                    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
                     p.setOpacity(self.pen_opacity / 255.0)
                     p.drawImage(0, 0, self.stroke_buffer); p.end()
                     self.stroke_buffer = None
                     self._invalidate_composite()
                 elif self.start_point != self.last_point:
-                    if self.stroke_buffer is not None:
-                        # Shape was drawn into stroke buffer for opacity
-                        p = QPainter(self.get_active())
+                    p = QPainter(self.get_active())
+                    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                    if self.pen_opacity < 255:
                         p.setOpacity(self.pen_opacity / 255.0)
-                        p.drawImage(0, 0, self.stroke_buffer); p.end()
-                        self.stroke_buffer = None
-                    else:
-                        p = QPainter(self.get_active())
-                        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-                        p.setPen(QPen(self.pen_color, self.pen_width))
-                        self._draw_shape(p, self.tool, self.start_point, self.last_point)
-                        p.end()
+                    _cap  = Qt.PenCapStyle.RoundCap  if self.round_lines else Qt.PenCapStyle.SquareCap
+                    _join = Qt.PenJoinStyle.RoundJoin if self.round_lines else Qt.PenJoinStyle.MiterJoin
+                    p.setPen(QPen(self.pen_color, self.pen_width, Qt.PenStyle.SolidLine, _cap, _join))
+                    self.drawing_tools._draw_shape(p, self.tool, self.start_point, self.last_point)
+                    p.end()
                     self._invalidate_composite()
                 self.drawing = False
                 self.update()
 
-    def _apply_resize(self, pos):
-        # Work from the raw (non-normalized) rect so dragging past zero
-        # causes the handles to cross, which naturally flips the buffer on commit.
-        r = QRect(self.selection_rect)
-        h = self.resize_handle
-        dx = pos.x() - self.resize_origin_pos.x()
-        dy = pos.y() - self.resize_origin_pos.y()
-        if abs(dx) < 1 and abs(dy) < 1: return
-        if h in (0, 3, 5): r.setLeft(r.left() + dx)
-        if h in (2, 4, 7): r.setRight(r.right() + dx)
-        if h in (0, 1, 2): r.setTop(r.top() + dy)
-        if h in (5, 6, 7): r.setBottom(r.bottom() + dy)
-        self.selection_rect = r
-        self.resize_origin_pos = pos
-
-    # ── Shape drawing ─────────────────────────────────────────────────────────
-    def _draw_shape(self, painter, tool, start, end):
-        r = QRect(start, end).normalized()
-        if tool == "rect":         painter.drawRect(r)
-        elif tool == "ellipse":    painter.drawEllipse(r)
-        elif tool == "line":       painter.drawLine(start, end)
-        elif tool == "rounded_rect": painter.drawRoundedRect(r, 12, 12)
-        elif tool == "triangle":   self._draw_ngon(painter, r, 3, offset=-90)
-        elif tool == "diamond":    self._draw_ngon(painter, r, 4, offset=0)
-        elif tool == "pentagon":   self._draw_ngon(painter, r, 5, offset=-90)
-        elif tool == "hexagon":    self._draw_ngon(painter, r, 6, offset=0)
-        elif tool == "star":       self._draw_star(painter, r)
-        elif tool == "arrow":      self._draw_arrow(painter, r)
-
-    def _draw_ngon(self, painter, r, sides, offset=0):
-        cx, cy = r.center().x(), r.center().y()
-        rx, ry = r.width() / 2, r.height() / 2
-        pts = []
-        for i in range(sides):
-            a = math.radians(i * 360 / sides + offset)
-            pts.append(QPoint(int(cx + rx * math.cos(a)), int(cy + ry * math.sin(a))))
-        painter.drawPolygon(QPolygon(pts))
-
-    def _draw_star(self, painter, r):
-        cx, cy = r.center().x(), r.center().y()
-        orx, ory = r.width() / 2, r.height() / 2
-        irx, iry = orx * 0.4, ory * 0.4
-        pts = []
-        for i in range(10):
-            a = math.radians(i * 36 - 90)
-            rx = orx if i % 2 == 0 else irx
-            ry = ory if i % 2 == 0 else iry
-            pts.append(QPoint(int(cx + rx * math.cos(a)), int(cy + ry * math.sin(a))))
-        painter.drawPolygon(QPolygon(pts))
-
-    def _draw_arrow(self, painter, r):
-        path = QPainterPath()
-        w, h = r.width(), r.height()
-        shaft_top = r.top() + h * 0.3
-        shaft_bot = r.top() + h * 0.7
-        head_x = r.left() + w * 0.6
-        path.moveTo(r.left(), shaft_top)
-        path.lineTo(head_x, shaft_top)
-        path.lineTo(head_x, r.top())
-        path.lineTo(r.right(), r.top() + h / 2)
-        path.lineTo(head_x, r.bottom())
-        path.lineTo(head_x, shaft_bot)
-        path.lineTo(r.left(), shaft_bot)
-        path.closeSubpath()
-        painter.drawPath(path)
-
     # ── Paint ─────────────────────────────────────────────────────────────────
     def paintEvent(self, event):
         p = QPainter(self)
+        if self.use_antialiasing:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.scale(self.zoom_factor, self.zoom_factor)
         p.drawImage(0, 0, self.get_composite())
 
@@ -418,254 +356,137 @@ class Canvas(QWidget):
             p.drawImage(0, 0, self.stroke_buffer)
             p.setOpacity(1.0)
 
-        # Floating selection buffer (with rotation)
-        if self.selection_state in ["selected", "moving", "resizing", "rotating"] \
-                and self.selection_buffer:
+        # Floating selection buffer (with rotation + live resize scaling)
+        if self.selection_manager.selection_state in ["selected", "moving", "resizing", "rotating"] \
+                and self.selection_manager.selection_buffer:
             p.save()
-            if self.selection_angle != 0.0:
-                cx = self.selection_rect.center().x()
-                cy = self.selection_rect.center().y()
+            if self.selection_manager.selection_angle != 0.0:
+                cx = self.selection_manager.selection_rect.center().x()
+                cy = self.selection_manager.selection_rect.center().y()
                 p.translate(cx, cy)
-                p.rotate(self.selection_angle)
-                p.translate(-self.selection_buffer.width() / 2,
-                             -self.selection_buffer.height() / 2)
-                p.drawImage(0, 0, self.selection_buffer)
+                p.rotate(self.selection_manager.selection_angle)
+                p.translate(-self.selection_manager.selection_buffer.width() / 2,
+                             -self.selection_manager.selection_buffer.height() / 2)
+                p.drawImage(0, 0, self.selection_manager.selection_buffer)
+            elif self.selection_manager.selection_state == "resizing":
+                # Live scale preview during drag — no commit needed
+                r = self.selection_manager.selection_rect.normalized()
+                if r.width() > 0 and r.height() > 0:
+                    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                    p.drawImage(r, self.selection_manager.selection_buffer)
             else:
-                p.drawImage(self.selection_rect.topLeft(), self.selection_buffer)
+                p.drawImage(self.selection_manager.selection_rect.topLeft(), self.selection_manager.selection_buffer)
             p.restore()
 
         # Selection border + handles
-        if self.selection_state != "idle" and not self.selection_rect.isNull():
+        if self.selection_manager.selection_state != "idle" and not self.selection_manager.selection_rect.isNull():
             p.save()
-            if self.selection_angle != 0.0:
-                cx = self.selection_rect.center().x()
-                cy = self.selection_rect.center().y()
-                p.translate(cx, cy); p.rotate(self.selection_angle)
-                p.translate(-self.selection_rect.width() / 2,
-                             -self.selection_rect.height() / 2)
+            if self.selection_manager.selection_angle != 0.0:
+                cx = self.selection_manager.selection_rect.center().x()
+                cy = self.selection_manager.selection_rect.center().y()
+                p.translate(cx, cy); p.rotate(self.selection_manager.selection_angle)
+                p.translate(-self.selection_manager.selection_rect.width() / 2,
+                             -self.selection_manager.selection_rect.height() / 2)
                 p.setPen(QPen(QColor(0, 120, 212), 1, Qt.PenStyle.DashLine))
-                p.drawRect(0, 0, self.selection_rect.width(), self.selection_rect.height())
+                p.drawRect(0, 0, self.selection_manager.selection_rect.width(), self.selection_manager.selection_rect.height())
             else:
                 p.setPen(QPen(QColor(0, 120, 212), 1, Qt.PenStyle.DashLine))
-                p.drawRect(self.selection_rect)
+                p.drawRect(self.selection_manager.selection_rect)
             p.restore()
 
             # Resize handles
             p.setPen(QPen(QColor(0, 120, 212), 1))
             p.setBrush(QBrush(Qt.GlobalColor.white))
-            for hr in self._handle_rects():
+            for hr in self.selection_manager._handle_rects():
                 p.drawRect(hr)
 
             # Rotation handle (green circle)
-            rp = self._rot_handle_pos()
-            tc = QPoint(self.selection_rect.center().x(), self.selection_rect.top())
+            rp = self.selection_manager._rot_handle_pos()
+            tc = QPoint(self.selection_manager.selection_rect.center().x(), self.selection_manager.selection_rect.top())
             p.setPen(QPen(QColor(0, 200, 100), 1))
             p.drawLine(tc, rp)
             p.setBrush(QBrush(Qt.GlobalColor.white))
-            p.drawEllipse(rp, HANDLE_SIZE // 2, HANDLE_SIZE // 2)
+            rot_r = self.selection_manager._handle_size_canvas() // 2
+            p.drawEllipse(rp, rot_r, rot_r)
 
         # Shape preview while drawing
-        if self.drawing and self.tool not in \
-                ["pencil", "eraser", "fill", "picker", "text", "select"]:
+        if self.drawing and self.tool not in                 ["pencil", "eraser", "fill", "picker", "text", "select"]:
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setPen(QPen(self.pen_color, self.pen_width))
-            self._draw_shape(p, self.tool, self.start_point, self.last_point)
+            self.drawing_tools._draw_shape(p, self.tool, self.start_point, self.last_point)
+
+        # Canvas edge resize handles + ghost preview
+        p.save()
+        p.resetTransform()
+        if self.canvas_resizer._edge_drag and self.canvas_resizer._edge_drag_w and self.canvas_resizer._edge_drag_h:
+            # Ghost preview of new canvas size
+            ghost_w = int(self.canvas_resizer._edge_drag_w * self.zoom_factor)
+            ghost_h = int(self.canvas_resizer._edge_drag_h * self.zoom_factor)
+            p.setPen(QPen(QColor(0, 120, 212), 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(0, 0, ghost_w, ghost_h)
+            # Draw handles at new position
+            hs = EDGE_HANDLE_SIZE
+            for hr in [
+                QRect(ghost_w - hs//2, ghost_h//2 - hs//2, hs, hs),
+                QRect(ghost_w//2 - hs//2, ghost_h - hs//2, hs, hs),
+                QRect(ghost_w - hs//2, ghost_h - hs//2, hs, hs),
+            ]:
+                p.setPen(QPen(QColor(0, 120, 212), 1))
+                p.setBrush(QBrush(Qt.GlobalColor.white))
+                p.drawRect(hr)
+        else:
+            cw, ch = self.canvas_resizer._canvas_pixel_size()
+            for hr in self.canvas_resizer._edge_handle_rects():
+                p.setPen(QPen(QColor(0, 120, 212), 1))
+                p.setBrush(QBrush(Qt.GlobalColor.white))
+                p.drawRect(hr)
+        p.restore()
+
+        # Brush cursor overlay for pencil/eraser
+        if self.show_brush_cursor and self.tool in ["pencil", "eraser"] and not self.cursor_pos.isNull():
+            p.save()
+            radius = max(1, int(self.pen_width / 2))
+            cp = QPointF(self.cursor_pos)
+            p.setPen(QPen(QColor(255, 255, 255, 180), 1, Qt.PenStyle.SolidLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(cp, float(radius), float(radius))
+            p.setPen(QPen(QColor(0, 0, 0, 180), 1, Qt.PenStyle.DotLine))
+            p.drawEllipse(cp, float(radius), float(radius))
+            p.restore()
+
+        # Live text preview — drawn last so it sits on top of everything
+        if self.text_tool.active:
+            self.text_tool.paint_preview(p)
 
     # ── Text ──────────────────────────────────────────────────────────────────
-    def finalize_text(self):
-        if not self.text_input.isVisible(): return
-        content = self.text_input.text().strip()
-        if content:
-            self.save_state()
-            p = QPainter(self.get_active())
-            color = QColor(self.pen_color)
-            color.setAlpha(self.pen_opacity)
-            p.setPen(color)
-            font = QFont(self.font_family, self.font_size)
-            font.setBold(self.font_bold); font.setItalic(self.font_italic)
-            p.setFont(font)
-            p.drawText(self.text_pos.x() + 2, self.text_pos.y() + self.font_size, content)
-            p.end(); self._invalidate_composite()
-        self.text_input.clear(); self.text_input.hide(); self.update()
-
-    # ── Flood fill ────────────────────────────────────────────────────────────
-    def flood_fill(self, x, y, tolerance=30):
-        """Tolerance-based scanline flood fill.
-        Pixels within  color distance of the target are filled,
-        which closes the anti-aliased gaps left along drawn edges.
-        """
-        active = self.get_active()
-        if not active.rect().contains(x, y): return
-        w, h = active.width(), active.height()
-        ptr = active.bits(); ptr.setsize(h * w * 4)
-        arr = np.frombuffer(ptr, dtype=np.uint32).reshape((h, w)).copy()
-
-        target = arr[y, x]
-        fc = self.pen_color
-        fill = np.uint32((fc.alpha() << 24) | (fc.red() << 16) |
-                         (fc.green() << 8) | fc.blue())
-        if target == fill: return
-
-        # Decompose target into ARGB channels as int16 to avoid overflow in diff
-        ta = np.int16((target >> 24) & 0xFF)
-        tr = np.int16((target >> 16) & 0xFF)
-        tg = np.int16((target >>  8) & 0xFF)
-        tb = np.int16( target        & 0xFF)
-
-        def in_tolerance(pixel):
-            a = np.int16((pixel >> 24) & 0xFF)
-            r = np.int16((pixel >> 16) & 0xFF)
-            g = np.int16((pixel >>  8) & 0xFF)
-            b = np.int16( pixel        & 0xFF)
-            return (abs(r-tr) + abs(g-tg) + abs(b-tb) + abs(a-ta)) <= tolerance * 4
-
-        mask = np.zeros((h, w), dtype=bool)
-        stack = [(x, y)]
-        while stack:
-            cx, cy = stack.pop()
-            if cx < 0 or cx >= w or cy < 0 or cy >= h: continue
-            if mask[cy, cx] or not in_tolerance(arr[cy, cx]): continue
-            xl = cx
-            while xl > 0 and not mask[cy, xl-1] and in_tolerance(arr[cy, xl-1]): xl -= 1
-            xr = cx
-            while xr < w-1 and not mask[cy, xr+1] and in_tolerance(arr[cy, xr+1]): xr += 1
-            mask[cy, xl:xr+1] = True
-            for nx in range(xl, xr+1):
-                if cy > 0 and not mask[cy-1, nx] and in_tolerance(arr[cy-1, nx]):
-                    stack.append((nx, cy-1))
-                if cy < h-1 and not mask[cy+1, nx] and in_tolerance(arr[cy+1, nx]):
-                    stack.append((nx, cy+1))
-        arr[mask] = fill
-        result = QImage(arr.tobytes(), w, h, QImage.Format.Format_ARGB32_Premultiplied)
-        p = QPainter(active)
-        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        p.drawImage(0, 0, result); p.end()
+    def finalize_text(self): self.text_tool.finalize_text()
 
     # ── Undo / Redo ───────────────────────────────────────────────────────────
-    def save_state(self):
-        if len(self.undo_history) > 30: self.undo_history.pop(0)
-        self.undo_history.append({
-            'layers': [img.copy() for img in self.layers],
-            'names': list(self.layer_names),
-            'visible': list(self.layer_visible),
-            'active': self.active_layer
-        })
-        self.redo_history.clear(); self.modified = True
-
-    def undo(self):
-        self.commit_selection()
-        if self.undo_history:
-            self.redo_history.append({'layers': [img.copy() for img in self.layers],
-                'names': list(self.layer_names), 'visible': list(self.layer_visible),
-                'active': self.active_layer})
-            state = self.undo_history.pop()
-            self.layers, self.layer_names, self.layer_visible, self.active_layer = \
-                state['layers'], state['names'], state['visible'], state['active']
-            self._invalidate_composite()
-            if self.layers_changed_callback: self.layers_changed_callback()
-            self.set_zoom(self.zoom_factor)
-
-    def redo(self):
-        self.commit_selection()
-        if self.redo_history:
-            self.undo_history.append({'layers': [img.copy() for img in self.layers],
-                'names': list(self.layer_names), 'visible': list(self.layer_visible),
-                'active': self.active_layer})
-            state = self.redo_history.pop()
-            self.layers, self.layer_names, self.layer_visible, self.active_layer = \
-                state['layers'], state['names'], state['visible'], state['active']
-            self._invalidate_composite()
-            if self.layers_changed_callback: self.layers_changed_callback()
-            self.set_zoom(self.zoom_factor)
+    def save_state(self): self.undo_redo_manager.save_state()
+    def undo(self): self.undo_redo_manager.undo()
+    def redo(self): self.undo_redo_manager.redo()
 
     # ── Layer ops ─────────────────────────────────────────────────────────────
-    def add_new_layer(self):
-        self.save_state()
-        new_img = QImage(self.layers[0].size(), QImage.Format.Format_ARGB32_Premultiplied)
-        new_img.fill(Qt.GlobalColor.transparent)
-        self.layers.append(new_img)
-        self.layer_names.append(f"Layer {len(self.layers)}")
-        self.layer_visible.append(True); self.active_layer = len(self.layers) - 1
-        self._invalidate_composite()
-        if self.layers_changed_callback: self.layers_changed_callback()
-        self.update()
-
-    def delete_layer(self, index):
-        if len(self.layers) <= 1: return
-        self.save_state()
-        self.layers.pop(index); self.layer_names.pop(index); self.layer_visible.pop(index)
-        self.active_layer = min(self.active_layer, len(self.layers) - 1)
-        self._invalidate_composite()
-        if self.layers_changed_callback: self.layers_changed_callback()
-        self.update()
-
-    def duplicate_layer(self, index):
-        self.save_state()
-        self.layers.insert(index + 1, self.layers[index].copy())
-        self.layer_names.insert(index + 1, self.layer_names[index] + " Copy")
-        self.layer_visible.insert(index + 1, self.layer_visible[index])
-        self.active_layer = index + 1
-        self._invalidate_composite()
-        if self.layers_changed_callback: self.layers_changed_callback()
-        self.update()
-
-    def move_layer(self, from_idx, to_idx):
-        """Move layer from from_idx to to_idx, shifting others accordingly."""
-        if from_idx == to_idx: return
-        if not (0 <= from_idx < len(self.layers)): return
-        if not (0 <= to_idx < len(self.layers)): return
-        self.save_state()
-        for lst in [self.layers, self.layer_names, self.layer_visible]:
-            item = lst.pop(from_idx)
-            lst.insert(to_idx, item)
-        self.active_layer = to_idx
-        self._invalidate_composite()
-        if self.layers_changed_callback: self.layers_changed_callback()
-        self.update()
-
-    def rename_layer(self, index, name):
-        if not name.strip(): return
-        self.layer_names[index] = name.strip()
-        if self.layers_changed_callback: self.layers_changed_callback()
-
-    def merge_down(self, index):
-        if index <= 0: return
-        self.save_state()
-        below = index - 1
-        merged = QImage(self.layers[below].size(), QImage.Format.Format_ARGB32_Premultiplied)
-        merged.fill(Qt.GlobalColor.transparent)
-        p = QPainter(merged)
-        p.drawImage(0, 0, self.layers[below]); p.drawImage(0, 0, self.layers[index])
-        p.end()
-        self.layers[below] = merged
-        self.layers.pop(index); self.layer_names.pop(index); self.layer_visible.pop(index)
-        self.active_layer = below
-        self._invalidate_composite()
-        if self.layers_changed_callback: self.layers_changed_callback()
-        self.update()
-
-    def merge_up(self, index):
-        if index >= len(self.layers) - 1: return
-        self.save_state()
-        above = index + 1
-        merged = QImage(self.layers[above].size(), QImage.Format.Format_ARGB32_Premultiplied)
-        merged.fill(Qt.GlobalColor.transparent)
-        p = QPainter(merged)
-        p.drawImage(0, 0, self.layers[index]); p.drawImage(0, 0, self.layers[above])
-        p.end()
-        self.layers[above] = merged
-        self.layers.pop(index); self.layer_names.pop(index); self.layer_visible.pop(index)
-        self.active_layer = above - 1
-        self._invalidate_composite()
-        if self.layers_changed_callback: self.layers_changed_callback()
-        self.update()
+    def add_new_layer(self): self.layer_manager.add_new_layer()
+    def delete_layer(self, index): self.layer_manager.delete_layer(index)
+    def duplicate_layer(self, index): self.layer_manager.duplicate_layer(index)
+    def move_layer(self, from_idx, to_idx): self.layer_manager.move_layer(from_idx, to_idx)
+    def rename_layer(self, index, name): self.layer_manager.rename_layer(index, name)
+    def merge_down(self, index): self.layer_manager.merge_down(index)
+    def merge_up(self, index): self.layer_manager.merge_up(index)
 
     # ── Canvas transforms ─────────────────────────────────────────────────────
+    # ── .sqish format ────────────────────────────────────────────────────────
+    def save_sqish(self, path): return FileIO.save_sqish(self, path)
+    def load_sqish(self, path): return FileIO.load_sqish(self, path)
+
     def set_zoom(self, factor):
         self.zoom_factor = max(0.2, min(5.0, factor))
         curr = self.layers[0]
-        self.setFixedSize(int(curr.width() * self.zoom_factor),
-                          int(curr.height() * self.zoom_factor))
+        # Add EDGE_MARGIN so edge handles are visible outside the image boundary
+        self.setFixedSize(int(curr.width() * self.zoom_factor) + EDGE_MARGIN,
+                          int(curr.height() * self.zoom_factor) + EDGE_MARGIN)
         if self.zoom_callback: self.zoom_callback(f"{int(self.zoom_factor * 100)}%")
         if self.dim_callback: self.dim_callback(f"{curr.width()} x {curr.height()}px")
         self.update()
@@ -680,17 +501,12 @@ class Canvas(QWidget):
             elif mode == "rot_180": self.layers[i] = self.layers[i].transformed(t.rotate(180))
         self._invalidate_composite(); self.set_zoom(self.zoom_factor)
 
-    def resize_canvas(self, new_w, new_h, anchor_x, anchor_y):
-        self.commit_selection(); self.save_state()
-        for i in range(len(self.layers)):
-            new_img = QImage(new_w, new_h, QImage.Format.Format_ARGB32_Premultiplied)
-            new_img.fill(Qt.GlobalColor.white if i == 0 else Qt.GlobalColor.transparent)
-            p = QPainter(new_img)
-            x = int((new_w - self.layers[i].width()) * anchor_x)
-            y = int((new_h - self.layers[i].height()) * anchor_y)
-            p.drawImage(x, y, self.layers[i]); p.end()
-            self.layers[i] = new_img
-        self._invalidate_composite(); self.set_zoom(self.zoom_factor)
+    def resize_canvas(self, new_w, new_h, anchor_x, anchor_y): self.canvas_resizer.resize_canvas(new_w, new_h, anchor_x, anchor_y)
+
+    # ── Canvas edge resize handles ────────────────────────────────────────────
+    def _canvas_pixel_size(self): return self.canvas_resizer._canvas_pixel_size()
+    def _edge_handle_rects(self): return self.canvas_resizer._edge_handle_rects()
+    def _hit_edge_handle(self, pos): return self.canvas_resizer._hit_edge_handle(pos)
 
     # ── Utilities ─────────────────────────────────────────────────────────────
     def map_to_canvas(self, screen_pos: QPointF) -> QPoint:
